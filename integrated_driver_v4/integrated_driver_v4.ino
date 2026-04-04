@@ -151,6 +151,7 @@ void setup() {
   while (!SD.begin(SD_CS) && sdRetries < 5) { sdRetries++; delay(200); }
   if (sdRetries >= 5) errorHalt(CRGB::Red, "SD Card failed!");
   
+  //Naming of microSD .bin files
   for (uint8_t i = 0; i < 100; i++) {
     fileName[6] = i / 10 + '0';
     fileName[7] = i % 10 + '0';
@@ -205,8 +206,7 @@ void setup() {
   
   leds[0] = CRGB::Cyan; FastLED.show();
   
-  // --- THE TIMELINE SYNC FIX ---
-  // Force all 64-bit timelines to sync to the exact same native microsecond
+  // Timestamp Sync
   uint32_t absoluteStart = micros();
   schLastMicros = absoluteStart;
   adxlLastMicros = absoluteStart;
