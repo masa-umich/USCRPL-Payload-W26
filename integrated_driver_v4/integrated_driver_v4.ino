@@ -91,7 +91,7 @@ struct BNO_Packet {
 
 // --- ERROR HANDLER ---
 void errorHalt(CRGB failColor, const char* msg) {
-  Serial.println(msg);
+  Serial5.println(msg);
   while(1) {
     leds[0] = failColor; FastLED.show(); delay(200);
     leds[0] = CRGB::Black; FastLED.show(); delay(200);
@@ -241,7 +241,7 @@ void setup() {
   leds[0] = CRGB::Blue; FastLED.show();
 
   // Initialize SD Card
-  Serial.print("Initializing SD card...");
+  Serial5.print("Initializing SD card...");
   int sdRetries = 0;
   while (!SD.begin(SD_CS) && sdRetries < 5) { sdRetries++; delay(200); }
   if (sdRetries >= 5) errorHalt(CRGB::Red, "SD Card failed!");
