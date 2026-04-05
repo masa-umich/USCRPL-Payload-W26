@@ -27,15 +27,15 @@ Adafruit_BNO08x bno08x(BNO_RESET);
 File dataFile;
 
 // --- SETTINGS & STATE ---
-char fileName[] = "IMULOG00.BIN"; // Changed to Binary
+char fileName[] = "IMULOG00.BIN";
 unsigned long lastFlushTime = 0;
 const unsigned long FLUSH_INTERVAL = 5000; 
 
-uint8_t currentPhase = 0; 
+uint8_t currentPhase = 0; // Boots into Phase 0 (Standby)
 uint8_t previousPhase = 0;
 bool phaseChanged = false; 
 
-// Independent Low Rate Timers for Asynchronous Logging
+// Independent Low Rate Timers
 const uint64_t LOW_RATE_INTERVAL = 1000000;
 uint64_t lastSchWrite = 0;
 uint64_t lastAdxlWrite = 0;
@@ -70,21 +70,18 @@ uint32_t bnoLastMicros = 0;
 
 // --- BINARY PACKET STRUCTURES ---
 #pragma pack(push, 1) 
-// SCH16T Packet (28 Bytes)
 struct SCH_Packet {
   uint8_t sync1 = 0xAA, sync2 = 0xBB; char type = 'S'; uint8_t phase;
   uint64_t timestamp; uint32_t delta_t;
   int16_t rateX, rateY, rateZ, accX, accY, accZ;
 } schPack;
 
-// ADXL359 Packet (28 Bytes)
 struct ADXL_Packet {
   uint8_t sync1 = 0xAA, sync2 = 0xBB; char type = 'A'; uint8_t phase;
   uint64_t timestamp; uint32_t delta_t;
   int32_t accX, accY, accZ;
 } adxlPack;
 
-// BNO086 Packet (29 Bytes)
 struct BNO_Packet {
   uint8_t sync1 = 0xAA, sync2 = 0xBB; char type = 'B'; uint8_t phase;
   uint64_t timestamp; uint32_t delta_t;
@@ -92,7 +89,7 @@ struct BNO_Packet {
 } bnoPack;
 #pragma pack(pop)
 
-// --- COLOR-CODED ERROR HANDLER ---
+// --- ERROR HANDLER ---
 void errorHalt(CRGB failColor, const char* msg) {
   Serial.println(msg);
   while(1) {
@@ -114,30 +111,128 @@ void adxl_ISR() {
   adxlLastMicros = current; adxlDataReady = true;
 }
 
+// ==========================================
+// POWER MANAGEMENT FUNCTIONS
+// ==========================================
+
+void shutdownSensors() {
+  Serial5.println("Entering Deep Sleep Mode...");
+  
+  // 1. Force BNO086 and SCH16T into Hardware Reset (Microamps)
+  digitalWrite(SCH_RESET, LOW);
+  digitalWrite(BNO_RESET, LOW);
+  
+  // 2. Push ADXL359 into Software Standby (21 Microamps)
+  SPI.beginTransaction(adxlSettings);
+  digitalWrite(ADXL_CS, LOW); 
+  SPI.transfer(ADXL_REG_POWER_CTL << 1); 
+  SPI.transfer(0x01); // 0x01 Sets the Standby Bit
+  digitalWrite(ADXL_CS, HIGH);
+  SPI.endTransaction();
+
+  // 3. Flush the SD Card so no data is lost
+  if (dataFile) {
+    dataFile.flush();
+  }
+}
+
+void initializeSensors() {
+  Serial5.println("Waking Sensors for Flight Mode...");
+  
+  // 1. Re-establish the precise Power-On Reset (POR) Sequence
+  // First, release the pins to HIGH to let the sensors' internal voltage stabilize
+  digitalWrite(SCH_RESET, HIGH);
+  digitalWrite(BNO_RESET, HIGH);
+  delay(10); 
+  
+  // Now, hit them with the exact 10ms hardware reset pulse from your V4 script
+  digitalWrite(SCH_RESET, LOW);
+  digitalWrite(BNO_RESET, LOW);
+  delay(10);
+  
+  // Pull HIGH and let them execute their internal bootloaders
+  digitalWrite(SCH_RESET, HIGH);
+  digitalWrite(BNO_RESET, HIGH);
+  
+  // The exact 100ms boot delay from your V4 script
+  delay(100); 
+
+  // 2. Wake ADXL359 (+/- 40g, 1000 Hz)
+  SPI.beginTransaction(adxlSettings);
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x2C << 1); SPI.transfer(0x83); digitalWrite(ADXL_CS, HIGH); delay(2);
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x28 << 1); SPI.transfer(0x02); digitalWrite(ADXL_CS, HIGH); delay(2);
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(ADXL_REG_POWER_CTL << 1); SPI.transfer(0x00); digitalWrite(ADXL_CS, HIGH);
+  SPI.endTransaction();
+
+  // 3. Boot BARE-METAL SCH16T-K10 (DEC8, 1.475kHz)
+  SPI.beginTransaction(schSettings);
+  delay(50); 
+  transfer32_safe(buildWriteCommand(0x36, 0x000A)); delay(40);
+  transfer32_safe(buildWriteCommand(0x28, 0x12DB)); 
+  transfer32_safe(buildWriteCommand(0x29, 0x12DB)); delay(5);
+  transfer32_safe(buildWriteCommand(0x33, 0x202C)); delay(10);
+  transfer32_safe(buildWriteCommand(0x35, 0x0001)); delay(250); 
+  for (uint8_t addr = 0x14; addr <= 0x1D; addr++) { transfer32_safe(buildReadCommand(addr)); delay(5); }
+  transfer32_safe(buildWriteCommand(0x35, 0x0003)); delay(10);
+  int flushCount = 0;
+  while (digitalRead(SCH_DRY_PIN) == HIGH && flushCount < 500) { transfer32_safe(READ_RATE_X2); flushCount++; }
+  transfer32_safe(READ_RATE_X2); 
+  SPI.endTransaction();
+
+  // 4. Boot BNO08x
+  if (!bno08x.begin_SPI(BNO_CS, BNO_INT)) {
+    Serial5.println("WARNING: BNO08x failed to wake up!"); 
+  } else {
+    bno08x.enableReport(SH2_ACCELEROMETER, 10000);
+    bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, 10000);
+    bno08x.enableReport(SH2_MAGNETIC_FIELD_CALIBRATED, 10000);
+  }
+
+  // 5. MASTER TIMELINE SYNC
+  uint32_t absoluteStart = micros();
+  schLastMicros = absoluteStart;
+  adxlLastMicros = absoluteStart;
+  schAbsoluteMicros = absoluteStart;
+  adxlAbsoluteMicros = absoluteStart;
+  lastSchWrite = absoluteStart;
+  lastAdxlWrite = absoluteStart;
+  lastBnoWrite = absoluteStart;
+  bnoLastMicros = absoluteStart;
+
+  schDataReady = false;
+  adxlDataReady = false;
+  
+  Serial5.println("Sensors Armed and Logging Started.");
+}
+
+
+// ==========================================
+// MAIN SETUP
+// ==========================================
+
 void setup() {
   unsigned long init_start = micros();
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(5);
   leds[0] = CRGB::White; FastLED.show();
 
-  //CS & Data Ready Config
+  // CS & Data Ready Config
   pinMode(SCH_CS, OUTPUT);  digitalWrite(SCH_CS, HIGH);
   pinMode(ADXL_CS, OUTPUT); digitalWrite(ADXL_CS, HIGH);
   pinMode(BNO_CS, OUTPUT);  digitalWrite(BNO_CS, HIGH);
   pinMode(SCH_DRY_PIN, INPUT_PULLDOWN);
   pinMode(ADXL_DRDY_PIN, INPUT);
 
-  //MOSI & SCLK Config
+  // MOSI & SCLK Clamping
   pinMode(13, OUTPUT); digitalWrite(13, LOW); 
   pinMode(11, OUTPUT); digitalWrite(11, LOW); 
-  delay(1000); 
+  delay(1000);
 
-  // HARDWARE RESETS
-  pinMode(SCH_RESET, OUTPUT); digitalWrite(SCH_RESET, LOW); delay(10); digitalWrite(SCH_RESET, HIGH); 
-  pinMode(BNO_RESET, OUTPUT); digitalWrite(BNO_RESET, LOW); delay(10); digitalWrite(BNO_RESET, HIGH);
-  delay(100); 
+  // HARDWARE RESETS (Start them explicitly LOW so they don't boot)
+  pinMode(SCH_RESET, OUTPUT); digitalWrite(SCH_RESET, LOW); 
+  pinMode(BNO_RESET, OUTPUT); digitalWrite(BNO_RESET, LOW); 
 
-  //Serial Config
+  // Serial Config
   Serial.begin(115200);
   Serial5.begin(9600); 
   while (!Serial && millis() < 3000); 
@@ -150,8 +245,8 @@ void setup() {
   int sdRetries = 0;
   while (!SD.begin(SD_CS) && sdRetries < 5) { sdRetries++; delay(200); }
   if (sdRetries >= 5) errorHalt(CRGB::Red, "SD Card failed!");
-  
-  //Naming of microSD .bin files
+
+  // Naming of microSD .bin files
   for (uint8_t i = 0; i < 100; i++) {
     fileName[6] = i / 10 + '0';
     fileName[7] = i % 10 + '0';
@@ -164,61 +259,21 @@ void setup() {
 
   SPI.begin();
 
-  // BARE-METAL ADXL359 (+/- 40g, 1000 Hz)
-  SPI.beginTransaction(adxlSettings);
-  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x2C << 1); SPI.transfer(0x83); digitalWrite(ADXL_CS, HIGH); delay(2);
-  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x28 << 1); SPI.transfer(0x02); digitalWrite(ADXL_CS, HIGH); delay(2);
-  digitalWrite(ADXL_CS, LOW); SPI.transfer(ADXL_REG_POWER_CTL << 1); SPI.transfer(0x00); digitalWrite(ADXL_CS, HIGH);
-  SPI.endTransaction();
-  Serial.println("ADXL359 Ready.");
-
-  // BARE-METAL SCH16T-K10 (DEC8, 1.475kHz)
-  SPI.beginTransaction(schSettings);
-  delay(50); 
-  transfer32_safe(buildWriteCommand(0x36, 0x000A)); delay(40);
-  transfer32_safe(buildWriteCommand(0x28, 0x12DB)); 
-  transfer32_safe(buildWriteCommand(0x29, 0x12DB)); delay(5);
-  transfer32_safe(buildWriteCommand(0x33, 0x202C)); delay(10);
-  transfer32_safe(buildWriteCommand(0x35, 0x0001)); delay(250); 
-  for (uint8_t addr = 0x14; addr <= 0x1D; addr++) { transfer32_safe(buildReadCommand(addr)); delay(5); }
-  transfer32_safe(buildWriteCommand(0x35, 0x0003)); delay(10);
-
-  int flushCount = 0;
-  while (digitalRead(SCH_DRY_PIN) == HIGH && flushCount < 500) { transfer32_safe(READ_RATE_X2); flushCount++; }
-  transfer32_safe(READ_RATE_X2); 
-  SPI.endTransaction();
-  Serial.println("SCH16T Ready.");
-
-  // Initialize BNO08x
-  if (!bno08x.begin_SPI(BNO_CS, BNO_INT)) errorHalt(CRGB::Purple, "BNO08x failed to start!"); 
-  bno08x.enableReport(SH2_ACCELEROMETER, 10000);
-  bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, 10000);
-  bno08x.enableReport(SH2_MAGNETIC_FIELD_CALIBRATED, 10000);
-  Serial.println("BNO08x Ready.");
-
   // ARM HARDWARE INTERRUPTS
   attachInterrupt(digitalPinToInterrupt(ADXL_DRDY_PIN), adxl_ISR, RISING);
   attachInterrupt(digitalPinToInterrupt(SCH_DRY_PIN), sch_ISR, RISING);
 
-  Serial.print("Logging Binary to: "); Serial.println(fileName);
-  unsigned long init_time = (micros() - init_start);
-  Serial5.print("Successfully Initialized in "); Serial5.print(init_time); Serial5.println("us");
+  // IMMEDIATELY SHUT DOWN THE SENSORS
+  // The system will now enter Phase 0 with all sensors asleep
+  shutdownSensors();
   
   leds[0] = CRGB::Cyan; FastLED.show();
-  
-  // Timestamp Sync
-  uint32_t absoluteStart = micros();
-  schLastMicros = absoluteStart;
-  adxlLastMicros = absoluteStart;
-  
-  schAbsoluteMicros = absoluteStart;
-  adxlAbsoluteMicros = absoluteStart;
-  
-  lastSchWrite = absoluteStart;
-  lastAdxlWrite = absoluteStart;
-  lastBnoWrite = absoluteStart;
-  bnoLastMicros = absoluteStart;
 }
+
+
+// ==========================================
+// MAIN LOOP
+// ==========================================
 
 void loop() {
   // --- 1. UART PHASE CONTROL ---
@@ -236,64 +291,104 @@ void loop() {
     } 
   }
 
-  // --- 2. FAILSAFE & RATE DETERMINATION ---
-  if (digitalRead(SCH_DRY_PIN) == HIGH && !schDataReady) { schLastMicros = micros(); schDataReady = true; }
-  
-  bool highRateMode = (currentPhase >= 1 && currentPhase <= 3);
+  bool isLowPower = (currentPhase == 0 || currentPhase == 4);
 
-  // --- 3. SCH16T PROCESS ---
-  if (schDataReady) {
-    noInterrupts();
-    schPack.timestamp = schAbsoluteMicros; schPack.delta_t = schDelta;
-    schDataReady = false;
-    interrupts();
+  // --- 2. PHASE TRANSITION EVENT TRIGGER ---
+  if (phaseChanged) {
+    bool wasLowPower = (previousPhase == 0 || previousPhase == 4);
+    
+    if (wasLowPower && !isLowPower) {
+      // Waking up from pad to flight
+      initializeSensors();
+    } 
+    else if (!wasLowPower && isLowPower) {
+      // Landing and shutting down
+      shutdownSensors();
+    }
+    phaseChanged = false;
+  }
 
-    SPI.beginTransaction(schSettings);
-    uint32_t respRx = transfer32_safe(READ_RATE_Y2); 
-    uint32_t respRy = transfer32_safe(READ_RATE_Z2); 
-    uint32_t respRz = transfer32_safe(READ_ACC_X2);  
-    uint32_t respAx = transfer32_safe(READ_ACC_Y2);  
-    uint32_t respAy = transfer32_safe(READ_ACC_Z2);  
-    uint32_t respAz = transfer32_safe(READ_RATE_X2); 
-    SPI.endTransaction();
+  // --- 3. THE LOW-POWER HALT ---
+  if (isLowPower) {
+    // We handle the 5-second LED blink, and then put the CPU to sleep.
+    // The Teensy's internal SysTick (which increments millis) will safely wake 
+    // it up every 1 millisecond, allowing it to check the LED and UART cleanly.
+    
+    static unsigned long lastBlinkTime = 0;
+    static bool isLedOn = false;
+    const unsigned long STANDBY_BLINK_INTERVAL = 5000; 
+    const unsigned long BLINK_DURATION = 10;
+    
+    if (!isLedOn && (millis() - lastBlinkTime >= STANDBY_BLINK_INTERVAL)) {
+      leds[0] = (currentPhase == 0) ? CRGB::Cyan : CRGB::Purple;
+      FastLED.show();
+      lastBlinkTime = millis();
+      isLedOn = true;
+    } 
+    else if (isLedOn && (millis() - lastBlinkTime >= BLINK_DURATION)) {
+      leds[0] = CRGB::Black;
+      FastLED.show();
+      isLedOn = false;
+    }
 
-    if (highRateMode || phaseChanged || (schAbsoluteMicros - lastSchWrite >= LOW_RATE_INTERVAL)) {
+    // Halt the 600MHz CPU to save power until the next SysTick or UART interrupt
+    asm volatile("wfi");
+  } 
+  else {
+    // ==========================================
+    // HIGH-SPEED FLIGHT MODE (Phases 1, 2, 3)
+    // ==========================================
+
+    // Failsafe
+    if (digitalRead(SCH_DRY_PIN) == HIGH && !schDataReady) { schLastMicros = micros(); schDataReady = true; }
+
+    // --- SCH16T PROCESS ---
+    if (schDataReady) {
+      noInterrupts();
+      schPack.timestamp = schAbsoluteMicros;
+      schDataReady = false;
+      interrupts();
+
+      SPI.beginTransaction(schSettings);
+      uint32_t respRx = transfer32_safe(READ_RATE_Y2); 
+      uint32_t respRy = transfer32_safe(READ_RATE_Z2); 
+      uint32_t respRz = transfer32_safe(READ_ACC_X2);
+      uint32_t respAx = transfer32_safe(READ_ACC_Y2);  
+      uint32_t respAy = transfer32_safe(READ_ACC_Z2);  
+      uint32_t respAz = transfer32_safe(READ_RATE_X2); 
+      SPI.endTransaction();
+
       schPack.phase = currentPhase;
-      schPack.delta_t = (uint32_t)(schAbsoluteMicros - lastSchWrite); // Accurate Log Delta
+      schPack.delta_t = (uint32_t)(schAbsoluteMicros - lastSchWrite); 
       schPack.rateX = (int16_t)((respRx >> 3) & 0xFFFF); schPack.rateY = (int16_t)((respRy >> 3) & 0xFFFF); schPack.rateZ = (int16_t)((respRz >> 3) & 0xFFFF);
       schPack.accX  = (int16_t)((respAx >> 3) & 0xFFFF); schPack.accY  = (int16_t)((respAy >> 3) & 0xFFFF); schPack.accZ  = (int16_t)((respAz >> 3) & 0xFFFF);
       dataFile.write((uint8_t*)&schPack, sizeof(schPack));
       lastSchWrite = schAbsoluteMicros;
     }
-  }
 
-  // --- 4. ADXL359 PROCESS ---
-  if (adxlDataReady) {
-    noInterrupts();
-    adxlPack.timestamp = adxlAbsoluteMicros; adxlPack.delta_t = adxlDelta;
-    adxlDataReady = false;
-    interrupts();
+    // --- ADXL359 PROCESS ---
+    if (adxlDataReady) {
+      noInterrupts();
+      adxlPack.timestamp = adxlAbsoluteMicros; 
+      adxlDataReady = false;
+      interrupts();
 
-    SPI.beginTransaction(adxlSettings);
-    digitalWrite(ADXL_CS, LOW); SPI.transfer((ADXL_REG_DATA_START << 1) | 0x01);
-    int32_t aX = readAdxl20Bit(); int32_t aY = readAdxl20Bit(); int32_t aZ = readAdxl20Bit();
-    digitalWrite(ADXL_CS, HIGH);
-    SPI.endTransaction();
+      SPI.beginTransaction(adxlSettings);
+      digitalWrite(ADXL_CS, LOW); SPI.transfer((ADXL_REG_DATA_START << 1) | 0x01);
+      int32_t aX = readAdxl20Bit(); int32_t aY = readAdxl20Bit(); int32_t aZ = readAdxl20Bit();
+      digitalWrite(ADXL_CS, HIGH);
+      SPI.endTransaction();
 
-    if (highRateMode || phaseChanged || (adxlAbsoluteMicros - lastAdxlWrite >= LOW_RATE_INTERVAL)) {
       adxlPack.phase = currentPhase;
-      adxlPack.delta_t = (uint32_t)(adxlAbsoluteMicros - lastAdxlWrite); // Accurate Log Delta
+      adxlPack.delta_t = (uint32_t)(adxlAbsoluteMicros - lastAdxlWrite); 
       adxlPack.accX = aX; adxlPack.accY = aY; adxlPack.accZ = aZ;
       dataFile.write((uint8_t*)&adxlPack, sizeof(adxlPack));
       lastAdxlWrite = adxlAbsoluteMicros;
     }
-  }
 
-// --- 5. BNO086 PROCESS ---
-  sh2_SensorValue_t sensorValue;
-  if (bno08x.getSensorEvent(&sensorValue)) {
-    // We use schAbsoluteMicros as the global Master Clock for the BNO
-    if (highRateMode || phaseChanged || (schAbsoluteMicros - lastBnoWrite >= LOW_RATE_INTERVAL)) {
+    // --- BNO086 PROCESS ---
+    sh2_SensorValue_t sensorValue;
+    if (bno08x.getSensorEvent(&sensorValue)) {
       bnoPack.phase = currentPhase;
       bnoPack.timestamp = schAbsoluteMicros; 
       bnoPack.delta_t = (uint32_t)(schAbsoluteMicros - lastBnoWrite);
@@ -318,65 +413,33 @@ void loop() {
         lastBnoWrite = schAbsoluteMicros;
       }
     }
-  }
 
-  // --- 6. FLUSH LOGIC ---
-  if (phaseChanged || millis() - lastFlushTime >= FLUSH_INTERVAL) {
-    if (dataFile) {
-      dataFile.flush();
-      lastFlushTime = millis();
-      phaseChanged = false; 
-      leds[0] = CRGB::Blue; FastLED.show();
+    // --- FLUSH LOGIC ---
+    if (millis() - lastFlushTime >= FLUSH_INTERVAL) {
+      if (dataFile) {
+        dataFile.flush();
+        lastFlushTime = millis();
+        leds[0] = CRGB::Blue; FastLED.show();
+      }
     }
-  }
 
-// --- 7. PHASE-AWARE POWER-SAVING HEARTBEAT ---
-  static unsigned long lastBlinkTime = 0;
-  static bool isLedOn = false;
-  const unsigned long STANDBY_BLINK_INTERVAL = 5000; // 5 seconds between flashes
-  const unsigned long BLINK_DURATION = 10;           // 10ms flash duration
-  
-  if (currentPhase == 0 || currentPhase == 4) {
-    // --- LOW POWER MODE (Standby & Landed) ---
-    // Only flash for 10ms every 5 seconds. Otherwise, stay completely off.
-    
-    if (!isLedOn && (millis() - lastBlinkTime >= STANDBY_BLINK_INTERVAL)) {
-      leds[0] = (currentPhase == 0) ? CRGB::Cyan : CRGB::Purple;
-      FastLED.show();
-      lastBlinkTime = millis();
-      isLedOn = true;
-    } 
-    else if (isLedOn && (millis() - lastBlinkTime >= BLINK_DURATION)) {
-      leds[0] = CRGB::Black; // Cut power to the WS2812B PWM chip
-      FastLED.show();
-      isLedOn = false;
-    }
-  } 
-  else {
-    // --- HIGH VISIBILITY MODE (Armed, Term, Flight) ---
-    // Restore the smooth pulsing heartbeat when power is not a concern
-    
-    static uint8_t pulse = 50; 
+    // --- ACTIVE FLIGHT HEARTBEAT ---
+    static uint8_t pulse = 50;
     static int8_t dir = 5;
     EVERY_N_MILLISECONDS(20) { 
-      pulse += dir; 
-      if(pulse >= 150 || pulse <= 20) dir = -dir; 
+      pulse += dir;
+      if(pulse >= 150 || pulse <= 20) dir = -dir;
     }
     
-    // Don't overwrite the Blue SD Card flush indicator
     if (millis() - lastFlushTime > 50) { 
       switch(currentPhase) {     
         case 1: leds[0] = CRGB::Yellow; break;     
         case 2: leds[0] = CRGB::DarkOrange; break; 
-        case 3: leds[0] = CRGB::Red; break;            
+        case 3: leds[0] = CRGB::Red; break;
       }
       leds[0].fadeToBlackBy(255 - pulse); 
       FastLED.show();
     }
-  }
-
-  if (currentPhase == 0 || currentPhase == 4) {
-    asm volatile("wfi");
   }
 }
 
