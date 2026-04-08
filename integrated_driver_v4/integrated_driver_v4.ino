@@ -37,11 +37,12 @@ CRGB leds[NUM_LEDS];
 Adafruit_BNO08x bno08x(BNO_RESET);
 
 // --- ASYNC DMA BUFFERS (ADXL359) ---
+#define ADXL_BATCH_SIZE 90
+#define ADXL_DMA_BYTES (1 + (ADXL_BATCH_SIZE * 9))
+
 EventResponder adxlDmaEvent;
-// First byte is the Read Command: (0x08 << 1) | 0x01 = 0x11
-// The 9 following zeros simply clock the bus to read the 3 axes (20-bit each)
-uint8_t adxlTxBuffer[10] = {0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0}; 
-volatile uint8_t adxlRxBuffer[10];
+uint8_t adxlTxBuffer[ADXL_DMA_BYTES];
+volatile uint8_t adxlRxBuffer[ADXL_DMA_BYTES];
 volatile bool adxlTransferInProgress = false;
 
 // --- SETTINGS & STATE ---
@@ -125,19 +126,16 @@ void sch_ISR() {
 }
 
 void adxl_ISR() {
-  if (adxlTransferInProgress) return; // Prevent double-triggering
+  if (adxlTransferInProgress) return; 
   adxlTransferInProgress = true;
 
-  uint32_t current = micros();
-  adxlDelta = current - adxlLastMicros; 
-  adxlAbsoluteMicros += adxlDelta;
-  adxlLastMicros = current; 
+  // This timestamp marks the exact arrival of the 90th sample
+  adxlAbsoluteMicros = micros(); 
 
-  // Immediately lock the bus, pull CS Low, and hand off to DMA controller
+  // Hand off to DMA controller
   SPI.beginTransaction(adxlSettings);
   digitalWrite(ADXL_CS, LOW);
-  SPI.transfer(adxlTxBuffer, (uint8_t*)adxlRxBuffer, 10, adxlDmaEvent);
-  // CPU EXITS IMMEDIATELY
+  SPI.transfer(adxlTxBuffer, (uint8_t*)adxlRxBuffer, ADXL_DMA_BYTES, adxlDmaEvent);
 }
 
 // --- DMA CALLBACK ---
@@ -298,6 +296,12 @@ void setup() {
   // --- DMA AND INTERRUPT BINDING ---
   adxlDmaEvent.attachInterrupt(adxlDmaFinishedCallback);
 
+  // Initialize ADXL DMA TX Buffer
+  adxlTxBuffer[0] = 0x11; // ADXL FIFO Read Command
+  for (int i = 1; i < ADXL_DMA_BYTES; i++) {
+    adxlTxBuffer[i] = 0x00; 
+  }
+
   // CRITICAL: Tells SPI library to mask these pins momentarily when 
   // SPI.beginTransaction() is called, preventing ISR/Main Loop bus collisions.
   SPI.usingInterrupt(digitalPinToInterrupt(ADXL_INT1_PIN));
@@ -389,28 +393,46 @@ void loop() {
     // --- ADXL359 PROCESS ---
     if (adxlDataReady) {
       noInterrupts();
-      adxlPack.timestamp = adxlAbsoluteMicros; 
-      adxlPack.delta_t = adxlDelta;
+      uint64_t batchEndTimestamp = adxlAbsoluteMicros; 
       adxlDataReady = false;
       interrupts();
 
-      adxlPack.phase = currentPhase;
-      
-      // Parse data out of the volatile DMA Rx buffer. 
-      // Byte 0 is the dummy response to the 0x11 command byte.
-      long aX = ((long)adxlRxBuffer[1] << 12) | ((long)adxlRxBuffer[2] << 4) | (adxlRxBuffer[3] >> 4);
-      if (aX & 0x80000) aX |= 0xFFF00000; 
+      // Iterate through the 90 samples stored in the volatile DMA buffer
+      for (int i = 0; i < ADXL_BATCH_SIZE; i++) {
+        // Calculate the byte offset for this specific sample
+        // +1 skips the dummy response to the 0x11 command byte
+        int offset = 1 + (i * 9); 
 
-      long aY = ((long)adxlRxBuffer[4] << 12) | ((long)adxlRxBuffer[5] << 4) | (adxlRxBuffer[6] >> 4);
-      if (aY & 0x80000) aY |= 0xFFF00000; 
+        // Unpack 20-bit X Axis
+        long aX = ((long)adxlRxBuffer[offset] << 12) | ((long)adxlRxBuffer[offset+1] << 4) | (adxlRxBuffer[offset+2] >> 4);
+        if (aX & 0x80000) aX |= 0xFFF00000; 
 
-      long aZ = ((long)adxlRxBuffer[7] << 12) | ((long)adxlRxBuffer[8] << 4) | (adxlRxBuffer[9] >> 4);
-      if (aZ & 0x80000) aZ |= 0xFFF00000; 
+        // Unpack 20-bit Y Axis
+        long aY = ((long)adxlRxBuffer[offset+3] << 12) | ((long)adxlRxBuffer[offset+4] << 4) | (adxlRxBuffer[offset+5] >> 4);
+        if (aY & 0x80000) aY |= 0xFFF00000; 
 
-      adxlPack.accX = aX; adxlPack.accY = aY; adxlPack.accZ = aZ;
-      
-      rb.write((uint8_t*)&adxlPack, sizeof(adxlPack));
-      lastAdxlWrite = adxlPack.timestamp;
+        // Unpack 20-bit Z Axis
+        long aZ = ((long)adxlRxBuffer[offset+6] << 12) | ((long)adxlRxBuffer[offset+7] << 4) | (adxlRxBuffer[offset+8] >> 4);
+        if (aZ & 0x80000) aZ |= 0xFFF00000; 
+
+        // Populate the struct
+        adxlPack.phase = currentPhase;
+        adxlPack.accX = aX; 
+        adxlPack.accY = aY; 
+        adxlPack.accZ = aZ;
+        
+        // --- TIMELINE RECONSTRUCTION MATH ---
+        // batchEndTimestamp is when the 90th sample (index 89) arrived.
+        // The ADXL ODR is 1000 Hz, so every sample is exactly 1,000 us apart.
+        // We calculate backward from the end timestamp.
+        uint64_t sampleTime = batchEndTimestamp - ((ADXL_BATCH_SIZE - 1 - i) * 1000ULL);
+        
+        adxlPack.timestamp = sampleTime;
+        adxlPack.delta_t = 1000; // Expected delta is exactly 1ms
+        
+        // Push this sample into the high-speed RAM buffer
+        rb.write((uint8_t*)&adxlPack, sizeof(adxlPack));
+      }
     }
 
     // --- BNO086 PROCESS ---
