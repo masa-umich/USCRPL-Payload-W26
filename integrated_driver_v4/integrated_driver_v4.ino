@@ -4,6 +4,7 @@
 #include <FastLED.h>
 #include <Adafruit_BNO08x.h>
 #include <stdint.h>
+#include <EventResponder.h> // Required for Teensy Async SPI (DMA)
 
 // --- HARDWARE CONFIG & PINS ---
 #define LED_PIN       23
@@ -15,6 +16,8 @@
 
 #define ADXL_CS       10  
 #define ADXL_DRDY_PIN 9
+#define ADXL_INT1_PIN 7
+#define ADXL_INT2_PIN 8
 
 #define BNO_CS        15  
 #define BNO_INT       16  
@@ -33,12 +36,20 @@ RingBuf<FsFile, RING_BUF_CAPACITY> rb;
 CRGB leds[NUM_LEDS];
 Adafruit_BNO08x bno08x(BNO_RESET);
 
+// --- ASYNC DMA BUFFERS (ADXL359) ---
+EventResponder adxlDmaEvent;
+// First byte is the Read Command: (0x08 << 1) | 0x01 = 0x11
+// The 9 following zeros simply clock the bus to read the 3 axes (20-bit each)
+uint8_t adxlTxBuffer[10] = {0x11, 0, 0, 0, 0, 0, 0, 0, 0, 0}; 
+volatile uint8_t adxlRxBuffer[10];
+volatile bool adxlTransferInProgress = false;
+
 // --- SETTINGS & STATE ---
 char fileName[] = "IMULOG00.BIN";
 
 uint8_t currentPhase = 0; // Boots into Phase 0 (Standby)
 uint8_t previousPhase = 0;
-bool phaseChanged = false; 
+bool phaseChanged = false;
 
 // Independent Low Rate Timers
 const uint64_t LOW_RATE_INTERVAL = 1000000; // 1 second logging interval
@@ -114,9 +125,28 @@ void sch_ISR() {
 }
 
 void adxl_ISR() {
+  if (adxlTransferInProgress) return; // Prevent double-triggering
+  adxlTransferInProgress = true;
+
   uint32_t current = micros();
-  adxlDelta = current - adxlLastMicros; adxlAbsoluteMicros += adxlDelta;
-  adxlLastMicros = current; adxlDataReady = true;
+  adxlDelta = current - adxlLastMicros; 
+  adxlAbsoluteMicros += adxlDelta;
+  adxlLastMicros = current; 
+
+  // Immediately lock the bus, pull CS Low, and hand off to DMA controller
+  SPI.beginTransaction(adxlSettings);
+  digitalWrite(ADXL_CS, LOW);
+  SPI.transfer(adxlTxBuffer, (uint8_t*)adxlRxBuffer, 10, adxlDmaEvent);
+  // CPU EXITS IMMEDIATELY
+}
+
+// --- DMA CALLBACK ---
+// This runs automatically when the DMA hardware finishes transferring all 10 bytes
+void adxlDmaFinishedCallback(EventResponderRef event) {
+  digitalWrite(ADXL_CS, HIGH);
+  SPI.endTransaction();
+  adxlTransferInProgress = false;
+  adxlDataReady = true; // Tell the main loop the parsed buffer is ready
 }
 
 // ==========================================
@@ -161,6 +191,8 @@ void initializeSensors() {
   SPI.beginTransaction(adxlSettings);
   digitalWrite(ADXL_CS, LOW); SPI.transfer(0x2C << 1); SPI.transfer(0xC3); digitalWrite(ADXL_CS, HIGH); delay(2); // 0xC3 fixes Active High Polarity
   digitalWrite(ADXL_CS, LOW); SPI.transfer(0x28 << 1); SPI.transfer(0x02); digitalWrite(ADXL_CS, HIGH); delay(2); // 1000Hz ODR & 250Hz corner frequency
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x29 << 1); SPI.transfer(0x5A); digitalWrite(ADXL_CS, HIGH); delay(2); // Set the FIFO Watermark to 90 samples
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x2A << 1); SPI.transfer(0x02); digitalWrite(ADXL_CS, HIGH); delay(2); // Map the FIFO Watermark (FIFO_FULL bit) to the INT1 Pin (Register 0x2A)
   digitalWrite(ADXL_CS, LOW); SPI.transfer(ADXL_REG_POWER_CTL << 1); SPI.transfer(0x00); digitalWrite(ADXL_CS, HIGH); 
   SPI.endTransaction();
 
@@ -200,7 +232,7 @@ void initializeSensors() {
   schAbsoluteMicros = absoluteStart; adxlAbsoluteMicros = absoluteStart;
   lastSchWrite = absoluteStart; lastAdxlWrite = absoluteStart;
   lastBnoWrite = absoluteStart; bnoLastMicros = absoluteStart;
-  schDataReady = false; adxlDataReady = false;
+  schDataReady = false; adxlDataReady = false; adxlTransferInProgress = false;
   
   Serial5.println("Sensors Armed and Logging Started.");
 }
@@ -211,7 +243,6 @@ void initializeSensors() {
 // ==========================================
 
 void setup() {
-  unsigned long init_start = micros();
   FastLED.addLeds<WS2812B, LED_PIN, GRB>(leds, NUM_LEDS);
   FastLED.setBrightness(5);
   leds[0] = CRGB::White; FastLED.show();
@@ -221,7 +252,7 @@ void setup() {
   pinMode(ADXL_CS, OUTPUT); digitalWrite(ADXL_CS, HIGH);
   pinMode(BNO_CS, OUTPUT);  digitalWrite(BNO_CS, HIGH);
   pinMode(SCH_DRY_PIN, INPUT_PULLDOWN);
-  pinMode(ADXL_DRDY_PIN, INPUT);
+  pinMode(ADXL_INT1_PIN, INPUT);
 
   // MOSI & SCLK Clamping
   pinMode(13, OUTPUT); digitalWrite(13, LOW); 
@@ -249,25 +280,30 @@ void setup() {
     fileName[6] = i / 10 + '0';
     fileName[7] = i % 10 + '0';
     if (!sd.exists(fileName)) {
-      // Open with Creation and Truncation flags
       dataFile = sd.open(fileName, O_RDWR | O_CREAT | O_TRUNC);
       break;
     }
   }
   if (!dataFile) errorHalt(CRGB::Red, "Could not create file!"); 
 
-  // Pre-allocate 100MB of contiguous space
+  // Pre-allocate contiguous space
   if (!dataFile.preAllocate(PRE_ALLOCATE_SIZE)) {
     Serial5.println("WARNING: Pre-allocation failed. Logging will be slower.");
   }
   
-  // Link the Ring Buffer to the File
   rb.begin(&dataFile);
 
   SPI.begin();
 
-  // ARM HARDWARE INTERRUPTS
-  attachInterrupt(digitalPinToInterrupt(ADXL_DRDY_PIN), adxl_ISR, RISING);
+  // --- DMA AND INTERRUPT BINDING ---
+  adxlDmaEvent.attachInterrupt(adxlDmaFinishedCallback);
+
+  // CRITICAL: Tells SPI library to mask these pins momentarily when 
+  // SPI.beginTransaction() is called, preventing ISR/Main Loop bus collisions.
+  SPI.usingInterrupt(digitalPinToInterrupt(ADXL_INT1_PIN));
+  SPI.usingInterrupt(digitalPinToInterrupt(SCH_DRY_PIN));
+
+  attachInterrupt(digitalPinToInterrupt(ADXL_INT1_PIN), adxl_ISR, RISING);
   attachInterrupt(digitalPinToInterrupt(SCH_DRY_PIN), sch_ISR, RISING);
 
   shutdownSensors();
@@ -325,7 +361,7 @@ void loop() {
 
     // --- HARDWARE FAILSAFES ---
     if (digitalRead(SCH_DRY_PIN) == HIGH && !schDataReady) { sch_ISR(); }
-    if (digitalRead(ADXL_DRDY_PIN) == HIGH && !adxlDataReady) { adxl_ISR(); }
+    if (digitalRead(ADXL_INT1_PIN) == HIGH && !adxlDataReady && !adxlTransferInProgress) { adxl_ISR(); }
 
     // --- SCH16T PROCESS ---
     if (schDataReady) {
@@ -346,7 +382,6 @@ void loop() {
       schPack.rateZ = (int16_t)((respRz >> 3) & 0xFFFF); schPack.accX  = (int16_t)((respAx >> 3) & 0xFFFF);
       schPack.accY  = (int16_t)((respAy >> 3) & 0xFFFF); schPack.accZ  = (int16_t)((respAz >> 3) & 0xFFFF);
       
-      // Write to RAM Buffer instead of directly to SD
       rb.write((uint8_t*)&schPack, sizeof(schPack));
       lastSchWrite = schAbsoluteMicros;
     }
@@ -355,22 +390,27 @@ void loop() {
     if (adxlDataReady) {
       noInterrupts();
       adxlPack.timestamp = adxlAbsoluteMicros; 
+      adxlPack.delta_t = adxlDelta;
       adxlDataReady = false;
       interrupts();
 
-      SPI.beginTransaction(adxlSettings);
-      digitalWrite(ADXL_CS, LOW); SPI.transfer((ADXL_REG_DATA_START << 1) | 0x01);
-      int32_t aX = readAdxl20Bit(); int32_t aY = readAdxl20Bit(); int32_t aZ = readAdxl20Bit();
-      digitalWrite(ADXL_CS, HIGH);
-      SPI.endTransaction();
-
       adxlPack.phase = currentPhase;
-      adxlPack.delta_t = (uint32_t)(adxlAbsoluteMicros - lastAdxlWrite);
+      
+      // Parse data out of the volatile DMA Rx buffer. 
+      // Byte 0 is the dummy response to the 0x11 command byte.
+      long aX = ((long)adxlRxBuffer[1] << 12) | ((long)adxlRxBuffer[2] << 4) | (adxlRxBuffer[3] >> 4);
+      if (aX & 0x80000) aX |= 0xFFF00000; 
+
+      long aY = ((long)adxlRxBuffer[4] << 12) | ((long)adxlRxBuffer[5] << 4) | (adxlRxBuffer[6] >> 4);
+      if (aY & 0x80000) aY |= 0xFFF00000; 
+
+      long aZ = ((long)adxlRxBuffer[7] << 12) | ((long)adxlRxBuffer[8] << 4) | (adxlRxBuffer[9] >> 4);
+      if (aZ & 0x80000) aZ |= 0xFFF00000; 
+
       adxlPack.accX = aX; adxlPack.accY = aY; adxlPack.accZ = aZ;
       
-      // Write to RAM Buffer
       rb.write((uint8_t*)&adxlPack, sizeof(adxlPack));
-      lastAdxlWrite = adxlAbsoluteMicros;
+      lastAdxlWrite = adxlPack.timestamp;
     }
 
     // --- BNO086 PROCESS ---
@@ -396,7 +436,6 @@ void loop() {
       }
       
       if (wroteData) {
-        // Write to RAM Buffer
         rb.write((uint8_t*)&bnoPack, sizeof(bnoPack));
         lastBnoWrite = schAbsoluteMicros;
       }
@@ -405,8 +444,6 @@ void loop() {
     // ==========================================
     // NON-BLOCKING SD BACKGROUND WRITE
     // ==========================================
-    // If the RAM buffer has collected at least 512 bytes, and the SD card 
-    // isn't busy doing something else, we write one sector to flash.
     size_t bytesToWrite = rb.bytesUsed();
     if (bytesToWrite >= 512 && !dataFile.isBusy()) {
       rb.writeOut(512); 
@@ -437,13 +474,6 @@ void loop() {
 }
 
 // --- HELPER FUNCTIONS ---
-long readAdxl20Bit() {
-  byte b1 = SPI.transfer(0x00); byte b2 = SPI.transfer(0x00); byte b3 = SPI.transfer(0x00);
-  long val = ((long)b1 << 12) | ((long)b2 << 4) | (b3 >> 4);
-  if (val & 0x80000) val |= 0xFFF00000; 
-  return val;
-}
-
 uint32_t transfer32_safe(uint32_t data) {
   uint32_t result = 0; digitalWrite(SCH_CS, LOW); delayMicroseconds(1);
   result |= ((uint32_t)SPI.transfer((data >> 24) & 0xFF)) << 24; result |= ((uint32_t)SPI.transfer((data >> 16) & 0xFF)) << 16;
