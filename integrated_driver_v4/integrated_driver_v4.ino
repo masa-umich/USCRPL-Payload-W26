@@ -36,7 +36,7 @@ uint8_t previousPhase = 0;
 bool phaseChanged = false; 
 
 // Independent Low Rate Timers
-const uint64_t LOW_RATE_INTERVAL = 1000000;
+const uint64_t LOW_RATE_INTERVAL = 1000000; // 1 second logging interval
 uint64_t lastSchWrite = 0;
 uint64_t lastAdxlWrite = 0;
 uint64_t lastBnoWrite = 0;
@@ -45,7 +45,7 @@ uint64_t lastBnoWrite = 0;
 SPISettings schSettings(4000000, MSBFIRST, SPI_MODE0);
 SPISettings adxlSettings(8000000, MSBFIRST, SPI_MODE0);
 
-// --- BARE-METAL COMMANDS ---
+// --- SCH16T Register Addresses AND COMMANDS---
 const uint32_t READ_RATE_X2 = 0x02800001;
 const uint32_t READ_RATE_Y2 = 0x02C00003;
 const uint32_t READ_RATE_Z2 = 0x03000006;
@@ -118,11 +118,11 @@ void adxl_ISR() {
 void shutdownSensors() {
   Serial5.println("Entering Deep Sleep Mode...");
   
-  // 1. Force BNO086 and SCH16T into Hardware Reset (Microamps)
+  // BNO086 and SCH16T Hardware Reset
   digitalWrite(SCH_RESET, LOW);
   digitalWrite(BNO_RESET, LOW);
   
-  // 2. Push ADXL359 into Software Standby (21 Microamps)
+  // ADXL359 Software Standby
   SPI.beginTransaction(adxlSettings);
   digitalWrite(ADXL_CS, LOW); 
   SPI.transfer(ADXL_REG_POWER_CTL << 1); 
@@ -130,7 +130,7 @@ void shutdownSensors() {
   digitalWrite(ADXL_CS, HIGH);
   SPI.endTransaction();
 
-  // 3. Flush the SD Card so no data is lost
+  // Flush the SD Card
   if (dataFile) {
     dataFile.flush();
   }
@@ -138,52 +138,61 @@ void shutdownSensors() {
 
 void initializeSensors() {
   Serial5.println("Waking Sensors for Flight Mode...");
+
+  //Match POR Sequence: Release -> Low -> Delay -> Release 
   
-  // 1. Re-establish the precise Power-On Reset (POR) Sequence
-  // First, release the pins to HIGH to let the sensors' internal voltage stabilize
   digitalWrite(SCH_RESET, HIGH);
   digitalWrite(BNO_RESET, HIGH);
   delay(10); 
-  
-  // Now, hit them with the exact 10ms hardware reset pulse from your V4 script
   digitalWrite(SCH_RESET, LOW);
   digitalWrite(BNO_RESET, LOW);
   delay(10);
-  
-  // Pull HIGH and let them execute their internal bootloaders
   digitalWrite(SCH_RESET, HIGH);
   digitalWrite(BNO_RESET, HIGH);
   
-  // The exact 100ms boot delay from your V4 script
+  // Booting delay
   delay(100); 
 
   // 2. Wake ADXL359 (+/- 40g, 1000 Hz)
   SPI.beginTransaction(adxlSettings);
-  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x2C << 1); SPI.transfer(0x83); digitalWrite(ADXL_CS, HIGH); delay(2);
-  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x28 << 1); SPI.transfer(0x02); digitalWrite(ADXL_CS, HIGH); delay(2);
-  digitalWrite(ADXL_CS, LOW); SPI.transfer(ADXL_REG_POWER_CTL << 1); SPI.transfer(0x00); digitalWrite(ADXL_CS, HIGH);
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x2C << 1); SPI.transfer(0xC3); digitalWrite(ADXL_CS, HIGH); delay(2); //Writing 0x83 to the range register, sets it to +/-40g, and DRY to active high
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(0x28 << 1); SPI.transfer(0x02); digitalWrite(ADXL_CS, HIGH); delay(2); //1000Hz ODR & 250Hz corner frequency
+  digitalWrite(ADXL_CS, LOW); SPI.transfer(ADXL_REG_POWER_CTL << 1); SPI.transfer(0x00); digitalWrite(ADXL_CS, HIGH); //Enables Measurement Mode
   SPI.endTransaction();
 
   // 3. Boot BARE-METAL SCH16T-K10 (DEC8, 1.475kHz)
+  //0x36: SPI Soft Reset
+  //0x28: Settings for Gyro post-processing decimation ratio and dynamic range
+  //0x29: Settings for ACC_X12, ACC_Y12, ACC_Z12 post-processing decimation ratio and dynamic range
+  //0x33: User controls for SYNC, Data Ready, Strength of SPI PD/PU, slew rate ctrl, hi-speed
+  //0x35: Test mode, EOI, EN_SENSOR
+
   SPI.beginTransaction(schSettings);
   delay(50); 
-  transfer32_safe(buildWriteCommand(0x36, 0x000A)); delay(40);
-  transfer32_safe(buildWriteCommand(0x28, 0x12DB)); 
-  transfer32_safe(buildWriteCommand(0x29, 0x12DB)); delay(5);
-  transfer32_safe(buildWriteCommand(0x33, 0x202C)); delay(10);
-  transfer32_safe(buildWriteCommand(0x35, 0x0001)); delay(250); 
-  for (uint8_t addr = 0x14; addr <= 0x1D; addr++) { transfer32_safe(buildReadCommand(addr)); delay(5); }
+  transfer32_safe(buildWriteCommand(0x36, 0x000A)); delay(40);  //Reset SPI
+  transfer32_safe(buildWriteCommand(0x28, 0x12DB));             //2000dps range for output registers 1 & 2, 8x decimation on output register 2 (1.475khz output rate)
+  transfer32_safe(buildWriteCommand(0x29, 0x12DB)); delay(5);   //+-16g range for output registers 1 & 2, 8x decimation on output register 2 (1.475khz output rate)
+  transfer32_safe(buildWriteCommand(0x33, 0x202C)); delay(10);  //3V3, Data register clear delay, Sync High Active, Sync Timeout 1.4ms, Data Freezing for decimated and interpolated outputs, DRY High Active, DRY Enabled, SPI Strong Pulldown, MISO and DRY Slew Rates Control Enabled, 10MHz Mode
+  transfer32_safe(buildWriteCommand(0x35, 0x0001)); delay(250); //Enable measurement
+  for (uint8_t addr = 0x14; addr <= 0x1D; addr++) { 
+    transfer32_safe(buildReadCommand(addr)); delay(5); 
+  }
   transfer32_safe(buildWriteCommand(0x35, 0x0003)); delay(10);
+
   int flushCount = 0;
-  while (digitalRead(SCH_DRY_PIN) == HIGH && flushCount < 500) { transfer32_safe(READ_RATE_X2); flushCount++; }
+  while (digitalRead(SCH_DRY_PIN) == HIGH && flushCount < 500) { 
+    transfer32_safe(READ_RATE_X2); 
+    flushCount++; 
+  }
+
   transfer32_safe(READ_RATE_X2); 
   SPI.endTransaction();
 
   // 4. Boot BNO08x
   if (!bno08x.begin_SPI(BNO_CS, BNO_INT)) {
     Serial5.println("WARNING: BNO08x failed to wake up!"); 
-  } else {
-    bno08x.enableReport(SH2_ACCELEROMETER, 10000);
+  } else { //Checks the state of all accel, gyro, and mag
+    bno08x.enableReport(SH2_ACCELEROMETER, 10000); 
     bno08x.enableReport(SH2_GYROSCOPE_CALIBRATED, 10000);
     bno08x.enableReport(SH2_MAGNETIC_FIELD_CALIBRATED, 10000);
   }
@@ -424,21 +433,25 @@ void loop() {
     }
 
     // --- ACTIVE FLIGHT HEARTBEAT ---
-    static uint8_t pulse = 50;
-    static int8_t dir = 5;
-    EVERY_N_MILLISECONDS(20) { 
-      pulse += dir;
-      if(pulse >= 150 || pulse <= 20) dir = -dir;
-    }
+    static unsigned long lastFlightBlinkTime = 0;
+    static bool isFlightLedOn = false;
+    const unsigned long FLIGHT_BLINK_INTERVAL = 5000;
+    const unsigned long FLIGHT_BLINK_DURATION = 10;
     
-    if (millis() - lastFlushTime > 50) { 
+    if (!isFlightLedOn && (millis() - lastFlightBlinkTime >= FLIGHT_BLINK_INTERVAL)) {
       switch(currentPhase) {     
         case 1: leds[0] = CRGB::Yellow; break;     
         case 2: leds[0] = CRGB::DarkOrange; break; 
         case 3: leds[0] = CRGB::Red; break;
       }
-      leds[0].fadeToBlackBy(255 - pulse); 
       FastLED.show();
+      lastFlightBlinkTime = millis();
+      isFlightLedOn = true;
+    } 
+    else if (isFlightLedOn && (millis() - lastFlightBlinkTime >= FLIGHT_BLINK_DURATION)) {
+      leds[0] = CRGB::Black;
+      FastLED.show();
+      isFlightLedOn = false;
     }
   }
 }
